@@ -1,0 +1,129 @@
+name: True Quality Sync IPTV
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Download, Probe, Filter, Deduplicate
+        run: |
+          python - <<'PY'
+          import re
+          import subprocess
+          import requests
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+
+          url = "http://iptv.cqshushu.com/index.php?s=wy2Dag-lQ5eZ6YQaLBg6pg&t=multicast&channels=1&format=m3u"
+          out = "gd_hotel_1080p.m3u"
+
+          print("⬇️ 1. 下载原始源...")
+          resp = requests.get(url, timeout=30)
+          text = resp.text
+
+          print("📝 2. 解析频道列表...")
+          channels = []
+          current_name = ""
+          current_extinf = ""
+          
+          # 提取频道名称和 URL
+          lines = text.splitlines()
+          for line in lines:
+              line = line.strip()
+              if not line: continue
+              if line.startswith("#EXTINF"):
+                  current_extinf = line
+                  # 尝试提取 tvg-id 或 tvg-name 作为去重的名字
+                  m_id = re.search(r'tvg-id="([^"]+)"', line)
+                  m_name = re.search(r'tvg-name="([^"]+)"', line)
+                  if m_id: current_name = m_id.group(1)
+                  elif m_name: current_name = m_name.group(1)
+                  else: current_name = line.split(",")[-1].strip()
+              elif line.startswith("http"):
+                  if current_name and current_extinf:
+                      # 剔除名字里写着 720 / 标清的频道
+                      if not re.search(r'(720|576|480)[pP]?|标清|SD', current_name, re.I):
+                          channels.append({
+                              "name": current_name,
+                              "extinf": current_extinf,
+                              "url": line
+                          })
+                  current_name = ""
+                  current_extinf = ""
+
+          print(f"共提取到 {len(channels)} 个待测频道，开始真实探测画质...")
+
+          # 用 ffprobe 测试单个流
+          def probe_stream(channel):
+              try:
+                  # 设定 5 秒超时，防止死链卡住
+                  cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height,bit_rate", "-of", "csv=p=0", "-timeout", "5000000", channel["url"]]
+                  result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+                  if result.returncode == 0:
+                      data = result.stdout.strip().split(",")
+                      if len(data) >= 2:
+                          width = int(data[0])
+                          height = int(data[1])
+                          bitrate = int(data[2]) if len(data) > 2 and data[2].isdigit() else 0
+                          # 只保留分辨率 >= 1080p
+                          if height >= 1080:
+                              channel["height"] = height
+                              channel["bitrate"] = bitrate
+                              return channel
+              except Exception:
+                  pass
+              return None
+
+          # 多线程并发探测，提速
+          valid_channels = []
+          with ThreadPoolExecutor(max_workers=10) as executor:
+              futures = [executor.submit(probe_stream, ch) for ch in channels]
+              for f in as_completed(futures):
+                  res = f.result()
+                  if res:
+                      valid_channels.append(res)
+                      print(f"✅ {res['name']} | {res['height']}p | {res['bitrate']/1000:.0f} kbps")
+
+          print(f"真实探测完成，过滤掉 720p 和死链后，剩余 {len(valid_channels)} 个频道。")
+
+          print("🧠 按频道名去重，保留码率最高的版本...")
+          best_channels = {}
+          for ch in valid_channels:
+              name = ch["name"]
+              # 如果还没记录，或者当前测出来的码率比之前记录的高，就替换
+              if name not in best_channels or ch["bitrate"] > best_channels[name]["bitrate"]:
+                  best_channels[name] = ch
+
+          result = ["#EXTM3U"]
+          for name, ch in best_channels.items():
+              result.append(ch["extinf"])
+              result.append(ch["url"])
+
+          with open(out, "w", encoding="utf-8") as f:
+              f.write("\n".join(result))
+          print(f"✅ 处理完成！最终保留 {len(best_channels)} 个高品质频道。")
+
+          # 打印最终结果供你核对
+          for name, ch in best_channels.items():
+              print(f"保留：{name} | {ch['height']}p | {ch['bitrate']/1000:.0f} kbps")
+          PY
+
+      - name: Commit and push
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add gd_hotel_1080p.m3u
+          git diff --staged --quiet || git commit -m "Real probe & deduplicate"
+          git push
