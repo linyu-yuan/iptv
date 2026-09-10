@@ -1,0 +1,38 @@
+name: Debug IPTV Source
+
+on:
+  workflow_dispatch: # 只允许手动触发
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download raw data
+        run: |
+          python - <<'PY'
+          import requests
+          url = "http://iptv.cqshushu.com/index.php?s=wy2Dag-lQ5eZ6YQaLBg6pg&t=multicast&channels=1&format=m3u"
+          headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+          
+          print("⬇️ 正在下载...")
+          resp = requests.get(url, headers=headers, timeout=30)
+          text = resp.text
+          
+          with open("raw_debug.m3u", "w", encoding="utf-8") as f:
+              f.write(text)
+          print(f"✅ 下载完成，共获取 {len(text)} 个字符，已保存为 raw_debug.m3u")
+          PY
+
+      - name: Commit raw file
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add raw_debug.m3u
+          git diff --staged --quiet || git commit -m "Debug raw download"
+          git push
