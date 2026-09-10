@@ -1,8 +1,8 @@
-name: Auto Fetch Guangdong Hotel IPTV
+name: Full Auto Fetch Guangdong Hotel IPTV
 
 on:
   schedule:
-    - cron: '0 */6 * * *'   # 每6小时自动运行
+    - cron: '0 */6 * * *'   # 每6小时全自动运行一次
   workflow_dispatch:         # 允许手动触发
 
 permissions:
@@ -22,7 +22,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install playwright requests beautifulsoup4
+          pip install playwright requests
           playwright install chromium
 
       - name: Auto Fetch and Filter
@@ -30,8 +30,8 @@ jobs:
           python - <<'PY'
           import asyncio
           import re
-          import requests
           import sys
+          import requests
           from playwright.async_api import async_playwright
 
           OUT_FILE = "gd_hotel_1080p.m3u"
@@ -39,75 +39,76 @@ jobs:
 
           async def main():
               async with async_playwright() as p:
-                  # 在 GitHub 服务器上启动虚拟浏览器
+                  # 启动无头浏览器
                   browser = await p.chromium.launch(headless=True)
-                  page = await browser.new_page(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+                  page = await browser.new_page(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
                   
                   try:
-                      print("正在打开网站...")
-                      await page.goto(SITE_URL, timeout=60000)
+                      print("🌐 1. 正在打开网站...")
+                      await page.goto(SITE_URL, timeout=60000, wait_until="networkidle")
                       
-                      # 1. 选择“酒店”
-                      print("正在选择'酒店'类型...")
-                      await page.locator("text=酒店").first.click()
+                      print("👇 2. 选择'酒店'类型...")
+                      await page.locator("input[placeholder*='类型'], .el-input__inner").first.click()
+                      await page.wait_for_timeout(500)
+                      await page.locator("li:has-text('酒店')").first.click()
                       await page.wait_for_timeout(1000)
                       
-                      # 2. 选择“广东”
-                      print("正在选择'广东'区域...")
-                      await page.locator("text=广东").first.click()
+                      print("👇 3. 选择'广东'区域...")
+                      # 尝试点击第二个下拉框，并选择广东
+                      await page.locator("input[placeholder*='区域'], .el-input__inner").nth(1).click()
+                      await page.wait_for_timeout(500)
+                      await page.locator("li:has-text('广东')").first.click()
                       await page.wait_for_timeout(1000)
                       
-                      # 3. 点击“搜索”
-                      print("点击搜索按钮...")
-                      await page.locator("text=搜索").first.click()
+                      print("🔍 4. 点击搜索...")
+                      await page.locator("button:has-text('搜索'), .search-btn").first.click()
                       
-                      # 4. 等待 IP 列表加载出来
-                      print("等待列表加载...")
-                      await page.wait_for_timeout(5000) # 等待5秒让列表渲染
+                      print("⏳ 5. 等待动态IP列表加载...")
+                      await page.wait_for_selector("text=/\\d+\\.\\d+\\.\\d+\\.\\d+/", timeout=15000)
+                      await page.wait_for_timeout(3000) # 再多等3秒，确保渲染完毕
                       
-                      # 5. 【新增逻辑】扫描 IP 列表，寻找节目数大于 100 的源
-                      print("正在扫描 IP 列表，寻找节目数大于100的源...")
-                      
-                      # 获取页面上所有包含IP地址（例如 113.170.147.186）的可点击元素
-                      # 这里我们用一段 JS 代码在浏览器内部执行，提取包含IP的列表项
-                      rows = await page.evaluate('''() => {
-                          // 寻找所有包含类似IP地址的文本块
-                          const items = Array.from(document.querySelectorAll('*')).filter(el => 
-                              el.children.length === 0 && /\\d+\\.\\d+\\.\\d+\\.\\d+/.test(el.textContent)
-                          );
-                          return items.map(el => el.textContent);
+                      print("🔎 6. 智能扫描大于100个频道的源...")
+                      # 在浏览器内部执行JS，穿透DOM寻找IP和数量
+                      ip_data = await page.evaluate('''() => {
+                          const ipRegex = /(\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3})/;
+                          const allNodes = Array.from(document.querySelectorAll('*'));
+                          const ipNodes = allNodes.filter(el => el.children.length === 0 && ipRegex.test(el.textContent));
+                          const results = [];
+                          ipNodes.forEach(node => {
+                              let parent = node.parentElement;
+                              for (let i = 0; i < 3; i++) {
+                                  if (!parent) break;
+                                  const text = parent.innerText || parent.textContent;
+                                  const match = text.match(/(\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3})\\s*.*?(\\d{2,4})/s);
+                                  if (match) {
+                                      results.push({ ip: match[1], count: parseInt(match[2]) });
+                                      break;
+                                  }
+                                  parent = parent.parentElement;
+                              }
+                          });
+                          // 去重
+                          const unique = Array.from(new Map(results.map(item => [item.ip, item])).values());
+                          return unique;
                       }''')
                       
-                      print(f"初步抓取到 {len(rows)} 个可能的IP节点，开始分析节目数量...")
-                      
-                      # 方便查找，把整个页面的文本拿下来做正则匹配
-                      page_text = await page.content()
-                      
-                      # 寻找类似 "113.170.147.186 129" 或 "27.3.125.82 20" 的格式
-                      # 正则解释：匹配一个IP地址，接着空白字符，接着一个数字（节目数）
-                      pattern = re.compile(r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\s+(\d{2,4})')
-                      matches = pattern.findall(page_text)
-                      
                       target_ip = None
-                      for ip, count in matches:
-                          count_int = int(count)
-                          if count_int > 100:
-                              print(f"找到合格的源！IP: {ip}, 节目数量: {count_int}")
-                              target_ip = ip
-                              break # 找到一个就够了，直接跳出循环
+                      for item in ip_data:
+                          if item['count'] > 100:
+                              print(f"🎯 发现合格源！IP: {item['ip']}，节目数: {item['count']}")
+                              target_ip = item['ip']
+                              break
                               
                       if not target_ip:
-                          print("本次运行未在页面上找到节目数大于100的源，跳过本次更新。")
+                          print("❌ 本次未找到节目数大于100的源，跳过更新，保留上次文件。")
                           await browser.close()
-                          sys.exit(0) # 不报错，安全退出
+                          sys.exit(0)
                           
-                      # 6. 点击找到的这个 IP
-                      print(f"正在点击 IP: {target_ip} 进入详情...")
+                      print(f"🖱️ 7. 点击进入 IP: {target_ip} 详情页...")
                       await page.locator(f"text={target_ip}").first.click()
-                      await page.wait_for_timeout(3000)
+                      await page.wait_for_timeout(5000)
                       
-                      # 7. 获取 M3U 接口链接
-                      print("获取 M3U 链接...")
+                      print("🔗 8. 寻找 M3U 接口链接...")
                       m3u_url = await page.evaluate('''() => {
                           const links = Array.from(document.querySelectorAll('a'));
                           const m3u = links.find(a => a.href.includes('.m3u') || a.textContent.includes('M3U'));
@@ -115,9 +116,8 @@ jobs:
                       }''')
                       
                       if not m3u_url:
-                          # 尝试点击“M3U接口”文字来触发
                           await page.locator("text=M3U接口").first.click()
-                          await page.wait_for_timeout(2000)
+                          await page.wait_for_timeout(3000)
                           m3u_url = await page.evaluate('''() => {
                               const links = Array.from(document.querySelectorAll('a'));
                               const m3u = links.find(a => a.href.includes('.m3u'));
@@ -125,25 +125,24 @@ jobs:
                           }''')
                           
                       if not m3u_url:
-                          print("未能提取到 M3U 链接，可能网站结构变了。")
+                          print("❌ 无法在详情页找到 M3U 链接。")
                           await browser.close()
                           sys.exit(0)
                           
-                      print(f"成功获取 M3U 链接: {m3u_url}")
+                      print(f"✅ 9. 成功获取 M3U 下载地址: {m3u_url}")
                       
-                      # 8. 下载 M3U 内容
+                      print("⬇️ 10. 开始下载 M3U 文件...")
                       resp = requests.get(m3u_url, timeout=30)
                       text = resp.text
                       
                   except Exception as e:
-                      print(f"自动操作过程中出错: {e}")
+                      print(f"💥 执行出错: {e}")
                       await browser.close()
-                      sys.exit(0)
+                      sys.exit(1)
                   finally:
                       await browser.close()
 
-                  # 9. 过滤 720p
-                  print("开始过滤 720p 及以下画质...")
+                  print("✂️ 11. 开始过滤 720p 及以下画质...")
                   result = []
                   keep = True
                   for line in text.splitlines():
@@ -161,7 +160,7 @@ jobs:
 
                   with open(OUT_FILE, "w", encoding="utf-8") as f:
                       f.write("\n".join(result))
-                  print(f"过滤完成，共保留 {len(result)} 行频道，已保存到 {OUT_FILE}")
+                  print(f"✅ 全部完成！共保留 {len(result)} 行频道，已保存到 {OUT_FILE}")
 
           asyncio.run(main())
           PY
